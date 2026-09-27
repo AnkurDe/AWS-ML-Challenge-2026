@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+models/*.joblib
+models/*.json
+output/*.tsv
+.pytest_cache/
+
+# Project exclude paths
+/.venvLinux/
