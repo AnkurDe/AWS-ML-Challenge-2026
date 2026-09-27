@@ -5,6 +5,12 @@ models/*.joblib
 models/*.json
 output/*.tsv
 .pytest_cache/
+# Challenge dataset
+dataset/
+
+# Downloaded challenge resource
+6ab10eb3b23ba_student_resource/
+6ab10eb3b23ba_student_resource.zip
 
 # Project exclude paths
 /.venvLinux/
