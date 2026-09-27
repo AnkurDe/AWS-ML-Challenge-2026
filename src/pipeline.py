@@ -18,12 +18,13 @@ from pathlib import Path
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
 
-from .blocking import BlockingConfig, CandidateGenerator
-from .features import build_feature_matrix
-from .model import PairMatcher, build_predictions
-from .model.threshold import macro_f05, tune_threshold
-from .preprocessing import normalize_address, normalize_name, normalize_name_core
+from src.blocking import BlockingConfig, CandidateGenerator
+from src.features import build_feature_matrix
+from src.model import PairMatcher, build_predictions
+from src.model.threshold import macro_f05, tune_threshold
+from src.preprocessing import normalize_address, normalize_name_core
 
 SEED = 42
 
@@ -36,8 +37,21 @@ class PipelineConfig:
     validation_fraction = 0.20
 
 
-def read_tsv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+def read_tsv(path: Path, columns: tuple[str, ...], source: str | None = None) -> pd.DataFrame:
+    # Parse bounded chunks and show progress instead of creating a parser-sized
+    # temporary allocation for the full multi-GB input.
+    chunks = pd.read_csv(
+        path,
+        sep="\t",
+        usecols=list(columns),
+        dtype=str,
+        keep_default_na=False,
+        chunksize=100_000,
+    )
+    loaded = []
+    for chunk in tqdm(chunks, desc=f"Loading {path.name}", unit="chunk"):
+        loaded.append(prepare_frame(chunk, source) if source else chunk)
+    return pd.concat(loaded, ignore_index=True, copy=False)
 
 
 def prepare_frame(frame: pd.DataFrame, source: str) -> pd.DataFrame:
@@ -46,22 +60,26 @@ def prepare_frame(frame: pd.DataFrame, source: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    frame = frame.copy()
+    # The frame is freshly loaded by load_dataset; copying it here needlessly
+    # doubles its memory while the multi-hundred-MB source files are prepared.
     frame["source"] = source
     frame["country_norm"] = frame["country"].fillna("").map(lambda x: str(x).strip().casefold())
-    frame["name_norm"] = frame["business_name"].map(normalize_name)
     frame["name_norm_core"] = frame["business_name"].map(normalize_name_core)
     frame["address_norm"] = frame["business_address"].map(normalize_address)
+    # Downstream retrieval and matching use only these normalized values.
+    # Discard their larger raw inputs and unused country/name-normalized fields.
+    frame.drop(columns=["business_name", "business_address", "country"], inplace=True)
     return frame
 
 
 def load_dataset(data_dir: Path, split: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
     directory = data_dir / split
-    s1 = prepare_frame(read_tsv(directory / f"{split}_source1.tsv"), "S1")
-    s2 = prepare_frame(read_tsv(directory / f"{split}_source2.tsv"), "S2")
-    s3 = prepare_frame(read_tsv(directory / f"{split}_source3.tsv"), "S3")
+    source_columns = ("entity_id", "business_name", "business_address", "country")
+    s1 = read_tsv(directory / f"{split}_source1.tsv", source_columns, "S1")
+    s2 = read_tsv(directory / f"{split}_source2.tsv", source_columns, "S2")
+    s3 = read_tsv(directory / f"{split}_source3.tsv", source_columns, "S3")
     truth_path = directory / f"{split}_ground_truth.tsv"
-    truth = read_tsv(truth_path) if truth_path.exists() else None
+    truth = read_tsv(truth_path, ("source1_entity_id", "matched_entity_ids")) if truth_path.exists() else None
     return s1, s2, s3, truth
 
 
@@ -73,16 +91,11 @@ def truth_map(truth: pd.DataFrame) -> dict[str, set[str]]:
     return result
 
 
-def target_map(source2: pd.DataFrame, source3: pd.DataFrame) -> dict[str, dict]:
-    targets = pd.concat([source2, source3], ignore_index=True)
-    return {str(row.entity_id): row._asdict() for row in targets.itertuples(index=False)}
-
-
-def quick_pair_score(source_row, target: dict) -> float:
+def quick_pair_score(source_name: str, source_address: str, target: dict) -> float:
     from rapidfuzz import fuzz
 
-    name_score = fuzz.token_set_ratio(source_row.name_norm_core, target["name_norm_core"])
-    address_score = fuzz.token_set_ratio(source_row.address_norm, target["address_norm"])
+    name_score = fuzz.token_set_ratio(source_name, target["name_norm_core"])
+    address_score = fuzz.token_set_ratio(source_address, target["address_norm"])
     return 0.65 * name_score + 0.35 * address_score
 
 
@@ -94,7 +107,10 @@ def cap_training_candidates(
     max_negatives_per_entity: int,
 ) -> dict[str, list[str]]:
     """Keep all generated positives and only the strongest generated negatives."""
-    source_rows = {str(row.entity_id): row for row in source1.itertuples(index=False)}
+    source_rows = {
+        str(row.entity_id): (row.name_norm_core, row.address_norm)
+        for row in source1.itertuples(index=False)
+    }
     result: dict[str, list[str]] = {}
     rng = random.Random(SEED)
 
@@ -102,7 +118,11 @@ def cap_training_candidates(
         actual = truth.get(s1_id, set())
         positives = [cid for cid in candidate_ids if cid in actual]
         negatives = [cid for cid in candidate_ids if cid not in actual]
-        negatives.sort(key=lambda cid: quick_pair_score(source_rows[s1_id], targets[cid]), reverse=True)
+        source_name, source_address = source_rows[s1_id]
+        negatives.sort(
+            key=lambda cid: quick_pair_score(source_name, source_address, targets[cid]),
+            reverse=True,
+        )
         if len(negatives) > max_negatives_per_entity:
             # Deterministic hard-negative sampling. A small random tie-break is not necessary.
             negatives = negatives[:max_negatives_per_entity]
@@ -157,10 +177,13 @@ def train(data_dir: Path, model_dir: Path) -> None:
     if truth_frame is None:
         raise FileNotFoundError("train_ground_truth.tsv is required for training.")
     truth = truth_map(truth_frame)
-    targets = target_map(s2, s3)
 
     train_s1, val_s1 = split_source1(s1)
     generator = make_generator().fit(s2, s3)
+    # Candidate indexes and compact target fields are now built; raw target
+    # frames are no longer needed and otherwise remain live throughout fitting.
+    del s2, s3
+    targets = generator._target_by_id
 
     train_candidates = generator.generate(train_s1)
     val_candidates = generator.generate(val_s1)
@@ -182,6 +205,7 @@ def train(data_dir: Path, model_dir: Path) -> None:
     x_train, _, y_train = build_labeled_data(train_s1, capped_train, train_truth, targets)
 
     matcher = PairMatcher().fit(x_train, y_train)
+    del x_train, y_train, capped_train, train_candidates
 
     x_val, val_keys, _ = build_labeled_data(val_s1, val_candidates, val_truth, targets)
     val_probabilities = matcher.predict_proba(x_val)
@@ -193,12 +217,15 @@ def train(data_dir: Path, model_dir: Path) -> None:
         val_s1["entity_id"].astype(str).tolist(),
     )
     score = macro_f05(val_predictions, val_truth)
+    del x_val, val_probabilities, val_keys, val_predictions, val_candidates
 
     # Refit using all training Source 1 entities with hard negatives selected from the full candidate set.
     full_candidates = generator.generate(s1)
     capped_full = cap_training_candidates(s1, full_candidates, truth, targets, PipelineConfig.max_train_negatives_per_entity)
+    del full_candidates
     x_full, _, y_full = build_labeled_data(s1, capped_full, truth, targets)
     matcher = PairMatcher().fit(x_full, y_full)
+    del x_full, y_full, capped_full
 
     model_dir.mkdir(parents=True, exist_ok=True)
     matcher.save(model_dir / "pair_matcher.joblib")
@@ -224,8 +251,9 @@ def predict(data_dir: Path, model_dir: Path, output_dir: Path) -> None:
     threshold = float(metadata["threshold"])
 
     generator = make_generator().fit(s2, s3)
+    del s2, s3
     candidates = generator.generate(s1)
-    targets = target_map(s2, s3)
+    targets = generator._target_by_id
     features, keys = build_feature_matrix(s1, candidates, targets)
     probabilities = matcher.predict_proba(features)
     predictions = build_predictions(keys, probabilities, threshold, s1["entity_id"].astype(str).tolist())

@@ -6,7 +6,7 @@ from collections import defaultdict, Counter
 
 import pandas as pd
 
-from ..preprocessing import name_first_token, name_prefix, normalize_name_core
+from src.preprocessing import name_first_token, name_prefix, normalize_name_core
 
 
 def char_ngrams(text: str, n: int = 3) -> set[str]:
@@ -30,23 +30,26 @@ class NameBlockIndex:
     def fit(self, frame: pd.DataFrame) -> "NameBlockIndex":
         token_frequency: Counter[tuple[str, str]] = Counter()
         ngram_frequency: Counter[tuple[str, str]] = Counter()
-        normalized_rows: list[tuple[str, str, str, str, set[str], set[str]]] = []
-
+        # First pass counts frequencies. Avoid retaining every row's token and
+        # n-gram sets: at this dataset size that intermediate is enormous.
         for row in frame.itertuples(index=False):
             country = str(row.country_norm)
-            entity_id = str(row.entity_id)
-            core = normalize_name_core(row.business_name)
-            prefix = name_prefix(row.business_name)
-            first = name_first_token(row.business_name)
-            tokens = set(core.split())
-            ngrams = char_ngrams(core)
-            normalized_rows.append((country, entity_id, prefix, first, tokens, ngrams))
+            tokens = set(row.name_norm_core.split())
+            ngrams = char_ngrams(row.name_norm_core)
             for token in tokens:
                 token_frequency[(country, token)] += 1
             for ngram in ngrams:
                 ngram_frequency[(country, ngram)] += 1
 
-        for country, entity_id, prefix, first, tokens, ngrams in normalized_rows:
+        # Second pass builds the inverted indexes with one row's tokens live at a time.
+        for row in frame.itertuples(index=False):
+            country = str(row.country_norm)
+            entity_id = str(row.entity_id)
+            core = row.name_norm_core
+            prefix = name_prefix(core)
+            first = name_first_token(core)
+            tokens = set(core.split())
+            ngrams = char_ngrams(core)
             if prefix:
                 self.prefix_index[(country, prefix)].add(entity_id)
             if first:

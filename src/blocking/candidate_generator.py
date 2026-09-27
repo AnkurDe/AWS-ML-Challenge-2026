@@ -7,9 +7,8 @@ from dataclasses import dataclass
 import pandas as pd
 from rapidfuzz import fuzz
 
-from ..preprocessing import normalize_address, normalize_name_core
-from .address_blocking import AddressBlockIndex
-from .name_blocking import NameBlockIndex
+from src.blocking.address_blocking import AddressBlockIndex
+from src.blocking.name_blocking import NameBlockIndex
 
 
 @dataclass(frozen=True)
@@ -29,7 +28,7 @@ class CandidateGenerator:
 
     def __init__(self, config: BlockingConfig | None = None) -> None:
         self.config = config or BlockingConfig()
-        self._targets: pd.DataFrame | None = None
+        self._fitted = False
         self._name_index = NameBlockIndex(
             self.config.max_name_block_frequency,
             self.config.max_name_ngram_frequency,
@@ -39,19 +38,29 @@ class CandidateGenerator:
 
     def fit(self, source2: pd.DataFrame, source3: pd.DataFrame) -> "CandidateGenerator":
         targets = pd.concat([source2, source3], ignore_index=True)
-        self._targets = targets
         self._name_index.fit(targets)
         self._address_index.fit(targets)
+        # Keep only the fields needed for ranking and pair features. A full
+        # row dictionary duplicates every raw and derived column for millions
+        # of targets; the temporary concatenated frame can then be released.
         self._target_by_id = {
-            str(row.entity_id): row._asdict() for row in targets.itertuples(index=False)
+            str(row.entity_id): {
+                "name_norm_core": row.name_norm_core,
+                "address_norm": row.address_norm,
+                "country_norm": row.country_norm,
+                "source": row.source,
+            }
+            for row in targets.itertuples(index=False)
         }
+        del targets
+        self._fitted = True
         return self
 
     def _rank(self, source_row, candidates: set[str]) -> list[str]:
         if not candidates:
             return []
-        query_name = normalize_name_core(source_row.business_name)
-        query_address = normalize_address(source_row.business_address)
+        query_name = source_row.name_norm_core
+        query_address = source_row.address_norm
         ranked: list[tuple[float, str]] = []
         for entity_id in candidates:
             target = self._target_by_id[entity_id]
@@ -63,12 +72,12 @@ class CandidateGenerator:
         return [entity_id for _, entity_id in ranked[: self.config.max_candidates_per_entity]]
 
     def generate_for_row(self, source_row) -> list[str]:
-        candidates = self._name_index.lookup(source_row.country_norm, source_row.business_name)
-        candidates.update(self._address_index.lookup(source_row.country_norm, source_row.business_address))
+        candidates = self._name_index.lookup(source_row.country_norm, source_row.name_norm_core)
+        candidates.update(self._address_index.lookup(source_row.country_norm, source_row.address_norm))
         return self._rank(source_row, candidates)
 
     def generate(self, source1: pd.DataFrame) -> dict[str, list[str]]:
-        if self._targets is None:
+        if not self._fitted:
             raise RuntimeError("CandidateGenerator.fit must be called first.")
         return {
             str(row.entity_id): self.generate_for_row(row)

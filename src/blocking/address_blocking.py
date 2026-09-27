@@ -6,7 +6,7 @@ from collections import defaultdict, Counter
 
 import pandas as pd
 
-from ..preprocessing import address_tokens, postal_tokens
+from src.preprocessing import address_tokens, postal_tokens
 
 
 class AddressBlockIndex:
@@ -20,19 +20,23 @@ class AddressBlockIndex:
 
     def fit(self, frame: pd.DataFrame) -> "AddressBlockIndex":
         frequency: Counter[tuple[str, str]] = Counter()
-        rows: list[tuple[str, str, set[str], set[str], set[str]]] = []
+        # Count first, then index on a second pass. Retaining token sets for all
+        # targets together causes a large peak allocation.
+        for row in frame.itertuples(index=False):
+            country = str(row.country_norm)
+            tokens = {token for token in address_tokens(row.address_norm) if len(token) >= 4}
+            for token in tokens:
+                frequency[(country, token)] += 1
 
         for row in frame.itertuples(index=False):
             country = str(row.country_norm)
             entity_id = str(row.entity_id)
-            tokens = {token for token in address_tokens(row.business_address) if len(token) >= 4}
-            postal = set(postal_tokens(row.business_address))
-            numbers = {token for token in address_tokens(row.business_address) if token.isdigit() and 2 <= len(token) <= 8}
-            rows.append((country, entity_id, tokens, postal, numbers))
-            for token in tokens:
-                frequency[(country, token)] += 1
-
-        for country, entity_id, tokens, postal, numbers in rows:
+            tokens = {token for token in address_tokens(row.address_norm) if len(token) >= 4}
+            postal = set(postal_tokens(row.address_norm))
+            numbers = {
+                token for token in address_tokens(row.address_norm)
+                if token.isdigit() and 2 <= len(token) <= 8
+            }
             for token in postal:
                 self.postal_index[(country, token)].add(entity_id)
             for number in numbers:
